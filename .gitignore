@@ -1,5 +1,7 @@
-./venv
-./csv
-./ROI
-./video
-./yolo26s.pt
+# Ignore whole folders
+video/
+csv/
+
+# Or ignore only certain file types
+*.mp4
+*.pt
