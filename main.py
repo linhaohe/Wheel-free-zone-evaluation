@@ -1,5 +1,6 @@
 import csv
 from pathlib import Path
+from collections import deque
 
 import cv2
 import numpy as np
@@ -21,15 +22,14 @@ SKIP_EXISTING = False    # True = skip videos that already have a CSV
 TIMESPAN_S = 30    # time period (video seconds) for the "unique IDs in last N s" count
 
 #Camera parameters for pixel to ground conversion
-CAM_HEIGHT = 3.55   # meters
-VFOV_DEG = 64.0   # vertical field of view in degrees
-HFOV_DEG = 124.0   # horizontal field of view in degrees
-pitch_deg = 30.0  # camera pitch angle in degrees (positive = looking down)
+CAM_HEIGHT = 3.66   # meters
+pitch_deg = 20.0  # camera pitch angle in degrees (positive = looking down)
 
 
 # --- Speed settings ---
 IMGSZ = 960        # inference size; lower (e.g. 480 or 320) = faster, less accurate
 FRAME_SKIP = 0     # frames to skip between processed ones (1 = every 2nd frame)
+fps = 15
 USE_GPU = torch.cuda.is_available()
 DEVICE = 0 if USE_GPU else "cpu"
 
@@ -90,19 +90,26 @@ def draw_roi(frame, title=""):
         elif key == 27:  # Esc
             raise KeyboardInterrupt
 
-def pixel_to_ground(u, v, W, H, hfov_deg, cam_height, pitch_deg, yaw_deg=0.0, f=None):
-    cx, cy = W / 2, H / 2
-    if f is None:
-        f = cx / np.radians(hfov_deg / 2)      # equidistant model: r = f * theta
+def load_calib(path):
+    data = np.load(path)
+    # key names depend on how you saved it; common: "K"/"mtx", "D"/"dist"
+    K = data["K"] if "K" in data else data["mtx"]
+    D = data["D"] if "D" in data else data["dist"]
+    return K.astype(np.float64), D.astype(np.float64)
 
-    dx, dy = u - cx, v - cy
-    r = np.hypot(dx, dy)
-    if r < 1e-9:
-        d_cam = np.array([0.0, 0.0, 1.0])
+def pixel_to_ground(u, v, K, D, cam_height, pitch_deg, yaw_deg=0.0, fisheye=True):
+    pts = np.array([[[u, v]]], dtype=np.float64)          # shape (1,1,2)
+
+    if fisheye:
+        # D must be shape (4,1) or (4,): k1..k4  (from cv2.fisheye.calibrate)
+        xy = cv2.fisheye.undistortPoints(pts, K, D.reshape(-1, 1)[:4])
     else:
-        theta = r / f                           # angle from optical axis (rad)
-        s = np.sin(theta) / r
-        d_cam = np.array([dx * s, dy * s, np.cos(theta)])
+        # D is (k1,k2,p1,p2[,k3,...])  (from cv2.calibrateCamera)
+        xy = cv2.undistortPoints(pts, K, D)
+
+    x, y = xy[0, 0]
+    d_cam = np.array([x, y, 1.0])
+    d_cam /= np.linalg.norm(d_cam)
 
     th = np.radians(pitch_deg)
     R_pitch = np.array([
@@ -123,24 +130,36 @@ def pixel_to_ground(u, v, W, H, hfov_deg, cam_height, pitch_deg, yaw_deg=0.0, f=
     t = -cam_height / d[1]
     return np.array([0, cam_height, 0]) + t * d
 
+
+HIST_S = 1.0   # seconds of position history used for speed
+
+
 def track_video(model, cap, roi, rows):
-    """Run tracking on an opened video; append one dict per video-second to `rows`.
+    """Run tracking on an opened video; append one dict per TIMESPAN_S to `rows`.
 
     q = stop this video (rows so far are kept), Esc = stop the whole batch.
     """
-    ids_seen_in_roi = set()  # every unique PERSON tracker ID that has entered the ROI
-    bicycle_ids = set()      # every unique BICYCLE tracker ID that has entered the ROI
+    ids_seen_in_roi = set()  # unique PERSON/BICYCLE IDs that have entered the ROI
+    bicycle_ids = set()      # unique BICYCLE IDs that have entered the ROI
 
     fps = cap.get(cv2.CAP_PROP_FPS) or 30
-    frame_width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-    frame_height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-    world = [pixel_to_ground(x, y, frame_width, frame_height, HFOV_DEG, CAM_HEIGHT, pitch_deg) for x, y in roi]
+    K, D = load_calib("./calibration/fisheye_calib.npz")
+
+    # ROI corners -> ground plane; fail clearly if any can't be projected
+    world = [pixel_to_ground(x, y, K, D, CAM_HEIGHT, pitch_deg) for x, y in roi]
+    bad = [tuple(int(c) for c in pt) for pt, w in zip(roi, world) if w is None]
+    if bad:
+        raise ValueError(
+            f"ROI points outside the valid calibration range or above the horizon: {bad}. "
+            "Draw the ROI further from the image borders / lower in the frame."
+        )
     ground_xz = np.array([[p[0], p[2]] for p in world], dtype=np.float32)
     area = cv2.contourArea(ground_xz)
-    # print(" ROI world Area (m^2):", cv2.contourArea(ground_xz))
+    if area <= 0:
+        raise ValueError("ROI ground area is zero; check the ROI points.")
 
-    frames_read = 0          # counts skipped frames too, so video time stays correct
-    last_seen = {}           # person tracker ID -> video time (s), coordinates world, and speed last in the ROI
+    frames_read = 0
+    last_seen = {}        # id -> {"hist": deque[(t, xz)], "speed": m/s, "t": last time seen}
     next_record_time = TIMESPAN_S
 
     while cap.isOpened():
@@ -149,16 +168,15 @@ def track_video(model, cap, roi, rows):
             break
         frames_read += 1
 
-        # Cheaply discard frames to speed up processing
         for _ in range(FRAME_SKIP):
             cap.grab()
             frames_read += 1
 
-        video_time = frames_read / fps  # seconds of video played so far
+        video_time = frames_read / fps
 
         results = model.track(
             frame, persist=True, classes=[0, 1], tracker="bytetrack.yaml",
-            conf=0.65, iou=0.4, imgsz=IMGSZ, device=DEVICE, quantize=32,
+            conf=0.65, iou=0.4, imgsz=IMGSZ, device=DEVICE,
             verbose=False,
         )
 
@@ -176,101 +194,91 @@ def track_video(model, cap, roi, rows):
                 x1, y1, x2, y2 = box.xyxy[0].tolist()
                 reference_point = ((x1 + x2) / 2, y2)  # bottom-center of the box
 
-                # 1 = inside, 0 = on edge, -1 = outside
-                inside = cv2.pointPolygonTest(roi, reference_point, False)
+                if cv2.pointPolygonTest(roi, reference_point, False) < 0:
+                    continue
 
-                if inside >= 0:
-                    class_name = model.names[int(box.cls.item())]
-                    confidence = float(box.conf.item())
-                    speed = 0.0
-                    label = f"{class_name} {confidence:.0%}"
+                class_name = model.names[int(box.cls.item())]
+                confidence = float(box.conf.item())
+                label = f"{class_name} {confidence:.0%}"
+                color = (255, 255, 255)
 
-                    if class_name == "person" or class_name == "bicycle":
-                        if class_name == "person":
-                            current_in_roi.add(track_id)
-                        else:
-                            bicycles_in_roi_now.add(track_id)
-                            bicycle_ids.add(track_id)
-                        ids_seen_in_roi.add(track_id)
-
-                        world_coordinates = pixel_to_ground(
-                            reference_point[0], reference_point[1],
-                            frame_width, frame_height,
-                            HFOV_DEG, CAM_HEIGHT, pitch_deg,
-                        )
-
-                        if track_id in last_seen:
-                            prev_time, prev_world, prev_speed = last_seen[track_id]
-                            dt = video_time - prev_time
-                            if world_coordinates is not None and prev_world is not None and 0 < dt <= 1.0:
-                                inst = float(np.linalg.norm(world_coordinates - prev_world)) / dt
-                                speed = 0.7 * prev_speed + 0.3 * inst   # smoothed, m/s
-                            else:
-                                speed = prev_speed
-
-                        last_seen[track_id] = (video_time, world_coordinates, speed)
-                        label = f"{class_name} {confidence:.0%} {speed:.1f} m/s"
-                        if class_name == "person":
-                            color = (0, 255, 0)       # green = person
-                        else:
-                            color = (255, 255, 255)
+                if class_name in ("person", "bicycle"):
+                    if class_name == "person":
+                        current_in_roi.add(track_id)
+                        color = (0, 255, 0)
                     else:
-                        color = (255, 255, 255)
+                        bicycles_in_roi_now.add(track_id)
+                        bicycle_ids.add(track_id)
+                    ids_seen_in_roi.add(track_id)
 
-                    cv2.rectangle(
-                        frame, (int(x1), int(y1)), (int(x2), int(y2)), color, 2,
-                    )
-                    cv2.putText(
-                        frame, label, (int(x1), max(int(y1) - 8, 15)),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2,
+                    world_coordinates = pixel_to_ground(
+                        reference_point[0], reference_point[1],
+                        K, D, CAM_HEIGHT, pitch_deg,
                     )
 
-        # Forget people not seen within the time period
+                    tr = last_seen.setdefault(
+                        track_id, {"hist": deque(), "speed": 0.0, "t": video_time}
+                    )
+                    tr["t"] = video_time
+                    if world_coordinates is not None:
+                        tr["hist"].append((video_time, world_coordinates[[0, 2]]))  # ground x, z
+                    while tr["hist"] and video_time - tr["hist"][0][0] > HIST_S:
+                        tr["hist"].popleft()
+
+                    if len(tr["hist"]) >= 2:
+                        t0, p0 = tr["hist"][0]
+                        t1, p1 = tr["hist"][-1]
+                        if t1 - t0 >= 0.3:                       # need enough baseline
+                            inst = float(np.linalg.norm(p1 - p0)) / (t1 - t0)
+                            tr["speed"] = 0.7 * tr["speed"] + 0.3 * inst   # smoothed, m/s
+
+                    label = f"{class_name} {confidence:.0%} {tr['speed']:.1f} m/s"
+
+                cv2.rectangle(frame, (int(x1), int(y1)), (int(x2), int(y2)), color, 2)
+                cv2.putText(
+                    frame, label, (int(x1), max(int(y1) - 8, 15)),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2,
+                )
+
+        # Forget IDs not seen for 5 s
         cutoff = video_time - 5
-        for tid in [t for t, ts in last_seen.items() if ts[0] < cutoff ]:
+        for tid in [t for t, tr in last_seen.items() if tr["t"] < cutoff]:
             del last_seen[tid]
 
-        # Record one row per time interval 
-        # if video_time >= next_record_time:
-        #     rows.append({
-        #         "video_time": round(video_time/60, 2),
-        #         "Density": len(last_seen)/area,  # people per m^2
-        #     })
-        #     next_record_time += TIMESPAN_S
-        speeds = [
-            spd for tid, (_, _, spd) in last_seen.items()
-            if tid in current_in_roi and spd is not None
-        ]
+        speeds = [tr["speed"] for tid, tr in last_seen.items() if tid in current_in_roi]
         average_speed = float(np.mean(speeds)) if speeds else 0.0
         max_speed = float(np.max(speeds)) if speeds else 0.0
+        density = len(current_in_roi) / area
+
+        # Record one CSV row every TIMESPAN_S seconds of video
+        if video_time >= next_record_time:
+            rows.append({"video_time": round(video_time, 1), "Density": round(density, 4)})
+            next_record_time += TIMESPAN_S
+
         cv2.putText(
-            frame,
-            f"In ROI now: {len(current_in_roi)} | Unique total: {len(ids_seen_in_roi)}",
+            frame, f"In ROI now: {len(current_in_roi)} | Unique total: {len(ids_seen_in_roi)}",
             (10, 25), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2,
         )
         cv2.putText(
-            frame, f"Density in person/m²: {len(last_seen)/area:.2f}",
+            frame, f"Density in person/m²: {density:.2f}",
             (10, 55), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2,
         )
         cv2.putText(
-            frame,
-            f"Average Speed: {average_speed:.1f} m/s",
+            frame, f"Average Speed: {average_speed:.1f} m/s",
             (10, 85), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2,
         )
         cv2.putText(
-            frame,
-            f"Max Speed: {max_speed:.1f} m/s",
+            frame, f"Max Speed: {max_speed:.1f} m/s",
             (10, 115), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2,
         )
         cv2.imshow(WINDOW, frame)
         key = cv2.waitKey(1) & 0xFF
         if key == ord("q"):
-            break                    # stop this video, go to the next
-        elif key == 27:              # Esc
-            raise KeyboardInterrupt  # stop everything
+            break
+        elif key == 27:
+            raise KeyboardInterrupt
         elif key == ord(" "):
-            cv2.waitKey(0)           # pause until any key is pressed
-
+            cv2.waitKey(0)
 
 def write_csv(rows, csv_path):
     if not rows:

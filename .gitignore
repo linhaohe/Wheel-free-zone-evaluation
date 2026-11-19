@@ -1,6 +1,7 @@
 # Ignore whole folders
 video/
 csv/
+calibration/
 
 # Or ignore only certain file types
 *.mp4
